@@ -87,20 +87,22 @@ class TemporalLinkAddressing:
         Returns:
             Tensor [B, N, N]: temporal link matrix to use at next time step
         """
-        batch_size = prev_link_matrix.shape[0]
-        words_num = prev_link_matrix.shape[1]
+        with tf.name_scope("update_link_matrix"):
+            plm_shape = tf.shape(prev_link_matrix)
+            batch_size = plm_shape[0]
+            words_num = plm_shape[1]
 
-        write_weighting_i = tf.expand_dims(write_weighting, 2)  # [b x N x 1 ] duplicate columns
-        write_weighting_j = tf.expand_dims(write_weighting, 1)  # [b x 1 X N ] duplicate rows
-        prev_precedence_vector_j = tf.expand_dims(prev_precedence_vector, 1)  # [b x 1 X N]
+            write_weighting_i = tf.expand_dims(write_weighting, 2)  # [b x N x 1 ] duplicate columns
+            write_weighting_j = tf.expand_dims(write_weighting, 1)  # [b x 1 X N ] duplicate rows
+            prev_precedence_vector_j = tf.expand_dims(prev_precedence_vector, 1)  # [b x 1 X N]
 
-        link_matrix = (
-            (1 - write_weighting_i - write_weighting_j) * prev_link_matrix
-            + (write_weighting_i * prev_precedence_vector_j)
-        )
-        zero_diagonal = tf.zeros([batch_size, words_num], dtype=link_matrix.dtype)
+            link_matrix = (
+                (1 - write_weighting_i - write_weighting_j) * prev_link_matrix
+                + (write_weighting_i * prev_precedence_vector_j)
+            )
+            zero_diagonal = tf.zeros([batch_size, words_num], dtype=link_matrix.dtype)
 
-        return tf.linalg.set_diag(link_matrix, zero_diagonal)
+            return tf.linalg.set_diag(link_matrix, zero_diagonal)
 
     @staticmethod
     def weightings(link_matrix, prev_read_weightings):
@@ -166,17 +168,49 @@ class AllocationAdressing:
             return usage_vector
 
     @staticmethod
+    def batch_invert_permutation(permutations):
+        """Returns batched `tf.invert_permutation` for every row in `permutations`."""
+        with tf.name_scope('batch_invert_permutation'):
+            perm = tf.cast(permutations, tf.float32)
+            dim = int(perm.get_shape()[-1])
+            size = tf.cast(tf.shape(perm)[0], tf.float32)
+            delta = tf.cast(tf.shape(perm)[-1], tf.float32)
+            rg = tf.range(0, size * delta, delta, dtype=tf.float32)
+            rg = tf.expand_dims(rg, 1)
+            rg = tf.tile(rg, [1, dim])
+            perm = tf.add(perm, rg)
+            flat = tf.reshape(perm, [-1])
+            perm = tf.math.invert_permutation(tf.cast(flat, tf.int32))
+            perm = tf.reshape(perm, [-1, dim])
+            return tf.math.subtract(perm, tf.cast(rg, tf.int32))
+
+    @staticmethod
+    def batch_gather(values, indices):
+        """Returns batched `tf.gather` for every row in the input."""
+        with tf.name_scope('batch_gather'):
+            # fix unknown shape issue by using tf.unstack
+            idxf = tf.expand_dims(tf.cast(indices, tf.float32), -1)
+            size = tf.shape(indices)[0]
+            rg = tf.range(tf.cast(size, tf.float32), dtype=tf.float32)
+            rg = tf.expand_dims(rg, -1)
+            rg = tf.tile(rg, [1, int(indices.get_shape()[-1])])
+            rg = tf.expand_dims(rg, -1)
+            gidx = tf.cast(tf.concat([rg, idxf], -1), tf.int32)
+            return tf.gather_nd(values, gidx)
+
+    @staticmethod
     def batch_unsort(tensor, indices):
         """Permute each batch in a batch first tensor according to tensor
         of indices.
         """
-        unpacked = tf.unstack(indices)
-        indices_inverted = tf.stack(
-            [tf.math.invert_permutation(permutation) for permutation in unpacked]
-        )
-
-        unpacked = zip(tf.unstack(tensor), tf.unstack(indices_inverted))
-        return tf.stack([tf.gather(value, index) for value, index in unpacked])
+        # unpacked = tf.unstack(indices)
+        # indices_inverted = tf.stack(
+        #     [tf.math.invert_permutation(permutation) for permutation in unpacked]
+        # )
+        indices_inverted = AllocationAdressing.batch_invert_permutation(indices)
+        # unpacked = zip(tf.unstack(tensor), tf.unstack(indices_inverted))
+        # return tf.stack([tf.gather(value, index) for value, index in unpacked])
+        return AllocationAdressing.batch_gather(tensor, indices_inverted)
 
     @staticmethod
     def weighting(usage_vector):
@@ -379,11 +413,23 @@ class Memory:
         )
 
     def get_initial_state(self, batch_size, dtype=tf.float32):
+        with tf.name_scope("memory_matrix"):
+            memory_matrix = tf.fill(dims=[batch_size, self._N, self._W], value=EPSILON)
+        with tf.name_scope("write_weighting"):
+            write_weighting = tf.fill(dims=[batch_size, self._N], value=EPSILON)
+        with tf.name_scope("read_weightings"):
+            read_weightings = tf.fill(dims=[batch_size, self._N, self._R], value=EPSILON)
+        with tf.name_scope("usage_vector"):
+            usage_vector = tf.zeros(shape=[batch_size, self._N], dtype=dtype)
+        with tf.name_scope("link_matrix"):
+            link_matrix = tf.zeros(shape=[batch_size, self._N, self._N], dtype=dtype)
+        with tf.name_scope("precedence_vector"):
+            precedence_vector = tf.zeros(shape=[batch_size, self._N], dtype=dtype)
         return Memory.state(
-            memory_matrix=tf.fill([batch_size, self._N, self._W], EPSILON),
-            usage_vector=tf.zeros([batch_size, self._N], dtype=dtype),
-            link_matrix=tf.zeros([batch_size, self._N, self._N], dtype=dtype),
-            precedence_vector=tf.zeros([batch_size, self._N], dtype=dtype),
-            write_weighting=tf.fill([batch_size, self._N], EPSILON),
-            read_weightings=tf.fill([batch_size, self._N, self._R], EPSILON),
+            memory_matrix=memory_matrix,
+            usage_vector=usage_vector,
+            link_matrix=link_matrix,
+            precedence_vector=precedence_vector,
+            write_weighting=write_weighting,
+            read_weightings=read_weightings
         )
